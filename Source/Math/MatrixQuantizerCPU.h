@@ -3,6 +3,7 @@
 #include "MatrixQuantizerImpl.h"
 #include "ColumnQuantizer.h"
 #include "QuantizedMatrix.h"
+#include "TopKMatrix.h"
 #include "CPUMatrix.h"
 
 #ifdef _WIN32
@@ -33,5 +34,12 @@ public:
 
     void UnquantizeAsync(QuantizedMatrix<ElemType>& inQMatrix, Matrix<ElemType>& outMatrix, bool add = false) override;
     void WaitUnquantizeAsyncDone() override;
+
+
+    void TopKAsync(const Matrix<ElemType>& inMatrix, const Matrix<ElemType>& inResidual, TopKMatrix<ElemType>& outQMatrix, Matrix<ElemType>& outResidual, int topK) override;
+    void WaitTopKAsyncDone() override;
+
+    void UnTopKAsync(TopKMatrix<ElemType>& inQMatrix, Matrix<ElemType>& outMatrix, int topK, bool add = false) override;
+    void WaitUnTopKAsyncDone() override;
 };
 } } }

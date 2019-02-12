@@ -177,12 +177,36 @@ QuantizedMatrix<ElemType>& MatrixQuantizerGPU<ElemType>::GetTempGPUQuantizedMatr
 
     return *m_tempGPUQuantizedMatrix;
 }
+    
+template <class ElemType>
+TopKMatrix<ElemType>& MatrixQuantizerGPU<ElemType>::GetTempGPUTopKMatrix(size_t numRows, size_t numCols, int topK, bool& newlyAllocated)
+{
+    newlyAllocated = false;
+
+    // Check if the existing one is good for our needs
+    if ((m_tempGPUTopKMatrix != nullptr) && (m_tempGPUTopKMatrix->GetNumRows() >= numRows) && (m_tempGPUTopKMatrix->GetNumCols() >= numCols))
+    {
+        return *m_tempGPUTopKMatrix;
+    }
+
+    if (m_tempGPUTopKMatrix!= nullptr)
+    {
+        delete m_tempGPUTopKMatrix;
+        m_tempGPUTopKMatrix= nullptr;
+    }
+
+    m_tempGPUTopKMatrix = new TopKMatrix<ElemType>(numRows, numCols, topK, (short) this->GetDeviceId());
+    newlyAllocated = true;
+
+    return *m_tempGPUTopKMatrix;
+}
+
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///cpubuffer should be page-locked memory allocated, otherwise CUDA will not be efficient (hence we don't use STL)
 template <class ElemType>
 MatrixQuantizerGPU<ElemType>::MatrixQuantizerGPU(int deviceId, bool useDedicatedComputeStream, bool forceSync /*= false*/)
-    : MatrixQuantizerImpl<ElemType>(deviceId), m_quantizeCompleteEvent(NULL), m_fetchCompleteEvent(NULL), m_tempMatrixZeroingCompleteEvent(NULL), m_assignCompleteEvent(NULL), m_forceSync(forceSync), m_tempGPUQuantizedMatrix(nullptr), m_quantizeOpIncludedFetch(false)
+    : MatrixQuantizerImpl<ElemType>(deviceId), m_quantizeCompleteEvent(NULL), m_fetchCompleteEvent(NULL), m_tempMatrixZeroingCompleteEvent(NULL), m_assignCompleteEvent(NULL), m_forceSync(forceSync), m_tempGPUQuantizedMatrix(nullptr), m_tempGPUTopKMatrix(nullptr), m_quantizeOpIncludedFetch(false)
 {
     PrepareDevice(this->GetDeviceId());
 
@@ -335,6 +359,119 @@ void MatrixQuantizerGPU<ElemType>::UnquantizeAsync(QuantizedMatrix<ElemType>& in
 
 template <class ElemType>
 void MatrixQuantizerGPU<ElemType>::WaitUnquantizeAsyncDone()
+{
+    PrepareDevice(this->GetDeviceId());
+    SyncEvent(m_quantizeCompleteEvent);
+}
+
+template <class ElemType>
+void MatrixQuantizerGPU<ElemType>::TopKAsync(const Matrix<ElemType>& inMatrix, const Matrix<ElemType>& inResidual, TopKMatrix<ElemType>& outQMatrix, Matrix<ElemType>& outResidual, int topK)
+{
+    // Verify various input matrix parameter's dimensions
+    assert((inMatrix.GetNumRows() == outQMatrix.GetNumRows()) && (inMatrix.GetNumCols() == outQMatrix.GetNumCols()));
+    assert((inMatrix.GetNumRows() == inResidual.GetNumRows()) && (inMatrix.GetNumCols() == inResidual.GetNumCols()));
+    assert((inMatrix.GetNumRows() == outResidual.GetNumRows()) && (inMatrix.GetNumCols() == outResidual.GetNumCols()));
+
+    PrepareDevice(this->GetDeviceId());
+    if (m_forceSync)
+    {
+        Sync();
+    }
+
+    bool GPUMatrixNewlyAllocated = false;
+    TopKMatrix<ElemType>& outQMatrixGPU = (outQMatrix.GetDeviceId() == CPUDEVICE) ? GetTempGPUTopKMatrix(outQMatrix.GetNumRows(), outQMatrix.GetNumCols(), topK, GPUMatrixNewlyAllocated) : outQMatrix;
+
+    // If we newly allocated the target GPU matrix then the aysnc zeroing of the matrix is still in procgress on
+    // the main compute stream. We must synchroniz with the mail compute stream in case the quantization
+    // compute stream is different from the main compute stream
+    if (GPUMatrixNewlyAllocated && (GetComputeStream() != GetStream()))
+    {
+        cudaEventRecord(m_tempMatrixZeroingCompleteEvent, GetStream()) || "cudaEventRecord failed";
+        cudaStreamWaitEvent(GetComputeStream(), m_tempMatrixZeroingCompleteEvent, 0 /*flags 'must be 0'*/) || "cudaStreamWaitEvent failed";
+    }
+
+    // Do the quantization on compute sstream and insert event into stream
+    _TopKMatrix<ElemType>(inMatrix.Data(), inResidual.Data(),
+            inMatrix.GetNumRows(), inMatrix.GetNumCols(),
+            outQMatrixGPU.Buffer(), topK, GetComputeStream(),
+            outResidual.Data());
+
+    RecordQuantizeCompleteEvent(GetComputeStream());
+
+    // copy from gpu to cpu if needed
+    m_quantizeOpIncludedFetch = false;
+    if (outQMatrix.GetDeviceId() == CPUDEVICE)
+    {
+        SyncQuantizeCompleEventAndFetchAndRecordFetchCompleteEvent(outQMatrix.Buffer(), outQMatrixGPU.Buffer(), outQMatrixGPU.GetSize());
+        m_quantizeOpIncludedFetch = true;
+    }
+}
+
+template <class ElemType>
+void MatrixQuantizerGPU<ElemType>::WaitTopKAsyncDone()
+{
+    PrepareDevice(this->GetDeviceId());
+
+    if (m_quantizeOpIncludedFetch)
+    {
+        SyncEvent(m_fetchCompleteEvent);
+    }
+    else
+    {
+        SyncEvent(m_quantizeCompleteEvent);
+    }
+}
+
+template <class ElemType>
+void MatrixQuantizerGPU<ElemType>::UnTopKAsync(TopKMatrix<ElemType>& inQMatrix, Matrix<ElemType>& outMatrix, int topK, bool add /*= false*/)
+{
+    // The outMatrix should be on the same GPU as m_inMatrix
+    assert(outMatrix.GetDeviceId() == this->GetDeviceId());
+
+    PrepareDevice(this->GetDeviceId());
+
+    // Verify  input matrix parameter's dimensions
+    assert((inQMatrix.GetNumRows() == outMatrix.GetNumRows()) && (inQMatrix.GetNumCols() == outMatrix.GetNumCols()));
+
+    bool GPUMatrixNewlyAllocated = false;
+    TopKMatrix<ElemType>& inQMatrixGPU = (inQMatrix.GetDeviceId() == CPUDEVICE) ? GetTempGPUTopKMatrix(inQMatrix.GetNumRows(), inQMatrix.GetNumCols(), topK, GPUMatrixNewlyAllocated) : inQMatrix;
+
+    if (inQMatrix.GetDeviceId() == CPUDEVICE)
+    {
+        // If the intermediate GPU Matrix was newly allocated, we need to wait for its zeroing to finish
+        // before assigning the inQMatrix contents
+        if (GPUMatrixNewlyAllocated)
+        {
+            cudaEventRecord(m_tempMatrixZeroingCompleteEvent, GetStream()) || "cudaEventRecord failed";
+            cudaStreamWaitEvent(GetAssignStream(), m_tempMatrixZeroingCompleteEvent, 0 /*flags 'must be 0'*/) || "cudaStreamWaitEvent failed";
+        }
+
+        // schedule assign to GPU (on transfer stream)
+        cudaMemcpyAsync(inQMatrixGPU.Buffer(), inQMatrix.Buffer(), inQMatrix.GetSize(), cudaMemcpyHostToDevice, GetAssignStream()) || "cudaMemcpyAsync failed";
+
+        // schedule to flag the assign-complete event
+        cudaEventRecord(m_assignCompleteEvent, GetAssignStream()) || "cudaEventRecord failed"; // for subsequent GPU operation to consume this buffer
+
+        if (m_forceSync)
+        {
+            SyncStream(GetAssignStream());
+        }
+
+        // let the computing stream wait for the assign complete
+        SyncAssignCompleteEvent(GetComputeStream());
+    }
+
+    // do the actually unquantization
+    _UnTopKMatrix(inQMatrixGPU.Buffer(), inQMatrixGPU.GetSize(),
+            outMatrix.Data(), outMatrix.GetNumRows(), outMatrix.GetNumCols(),
+            add, GetComputeStream(), topK);
+
+    // Record the event of unquantization
+    RecordQuantizeCompleteEvent(GetComputeStream());
+}
+
+template <class ElemType>
+void MatrixQuantizerGPU<ElemType>::WaitUnTopKAsyncDone()
 {
     PrepareDevice(this->GetDeviceId());
     SyncEvent(m_quantizeCompleteEvent);

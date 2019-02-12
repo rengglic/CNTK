@@ -308,6 +308,7 @@ protected:
 
     // Data parallel SGD training parameters
     intargvector m_numGradientBits;
+    intargvector m_topK;
     bool m_bufferedAsyncGradientAggregation;
     bool m_zeroThresholdFor1Bit;
 
@@ -379,7 +380,9 @@ public:
           m_prevChosenMinibatchSize(0),
           m_lastFinishedEpochTrainLoss(0.0),
           m_distGradAgg(nullptr),
-          m_gradHeader(nullptr)
+          m_distGradAgg_smallMatrices(nullptr),
+          m_gradHeader(nullptr),
+          m_gradHeader2(nullptr)
     {
         msra::files::make_intermediate_dirs(m_modelPath);
     }
@@ -530,7 +533,7 @@ protected:
                          ::CNTK::Internal::TensorBoardFileWriterPtr tensorBoardWriter = nullptr,
                          const int startEpoch = 0);
 
-    void InitDistGradAgg(int numEvalNodes, int numGradientBits, int deviceId, int traceLevel);
+    void InitDistGradAgg(int numEvalNodes, int numGradientBits, int topK, int deviceId, int traceLevel);
     void InitModelAggregationHandler(int traceLevel, DEVICEID_TYPE devID);
 public:
     // UpdateWeights() - actual weight update, implementing various update rules
@@ -609,7 +612,9 @@ protected:
     double m_lastFinishedEpochTrainLoss;
 
     std::shared_ptr<IDistGradAggregator<ElemType>> m_distGradAgg;
+    std::shared_ptr<IDistGradAggregator<ElemType>> m_distGradAgg_smallMatrices;
     std::shared_ptr<struct DistGradHeader> m_gradHeader;
+    std::shared_ptr<struct DistGradHeader> m_gradHeader2;
 
     shared_ptr<IMASGD<ElemType>> m_pMASGDHelper;
 

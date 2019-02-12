@@ -1,6 +1,7 @@
 #pragma once
 
 #include "QuantizedMatrix.h" // TODO: strangely, this must be included first, although it is the first thing MatrixQuantizer.h includes. Without, nvcc fails.
+#include "TopKMatrix.h"
 #include "MatrixQuantizerImpl.h"
 #include "ColumnQuantizer.h"
 #include "GPUMatrix.h"
@@ -29,9 +30,17 @@ public:
     void UnquantizeAsync(QuantizedMatrix<ElemType>& inQMatrix, Matrix<ElemType>& outMatrix, bool add = false) override;
     void WaitUnquantizeAsyncDone() override;
 
+    void TopKAsync(const Matrix<ElemType>& inMatrix, const Matrix<ElemType>& inResidual, TopKMatrix<ElemType>& outQMatrix, Matrix<ElemType>& outResidual, int topK) override;
+    void WaitTopKAsyncDone() override;
+
+    void UnTopKAsync(TopKMatrix<ElemType>& inQMatrix, Matrix<ElemType>& outMatrix, int topK, bool add = false) override;
+    void WaitUnTopKAsyncDone() override;
+
+
 private:
     // Helper function to get a temporary intermediate matrix on the GPU to store quantization results
     QuantizedMatrix<ElemType>& GetTempGPUQuantizedMatrix(size_t numRows, size_t numCols, size_t nBits, bool& newlyAllocated);
+    TopKMatrix<ElemType>& GetTempGPUTopKMatrix(size_t numRows, size_t numCols, int topK, bool& newlyAllocated);
 
 #ifndef CPUONLY
     // Record a event to flag the completion of quantization/unquantization kernel on the compute stream
@@ -79,6 +88,7 @@ private:
 
     // A temporary intermediate QuantizedMatrix buffer on the GPU
     QuantizedMatrix<ElemType>* m_tempGPUQuantizedMatrix;
+    TopKMatrix<ElemType>* m_tempGPUTopKMatrix;
 };
 
 // This type records and synchronizes events on the main

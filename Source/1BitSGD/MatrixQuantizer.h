@@ -7,6 +7,7 @@
 
 #include "ColumnQuantizer.h"
 #include "QuantizedMatrix.h"
+#include "TopKMatrix.h"
 #include "MatrixQuantizerImpl.h"
 
 namespace Microsoft { namespace MSR { namespace CNTK {
@@ -60,6 +61,26 @@ public:
     void WaitUnquantizeAsyncDone()
     {
         m_quantizerImpl->WaitUnquantizeAsyncDone();
+    }
+
+    void TopKAsync(const Matrix<ElemType>& inMatrix, TopKMatrix<ElemType>& outTMatrix, int topK)
+    {
+        m_quantizerImpl->TopKAsync(inMatrix, *m_residual, outTMatrix, *m_residual, topK);
+    }
+
+    void WaitTopKAsyncDone()
+    {
+        m_quantizerImpl->WaitTopKAsyncDone();
+    }
+
+    void UnTopKAsync(TopKMatrix<ElemType>& inQMatrix, Matrix<ElemType>& outMatrix, int topK, bool add = false)
+    {
+        m_quantizerImpl->UnTopKAsync(inQMatrix, outMatrix, topK, add);
+    }
+
+    void WaitUnTopKAsyncDone()
+    {
+        m_quantizerImpl->WaitUnTopKAsyncDone();
     }
 
     int GetDeviceId() const

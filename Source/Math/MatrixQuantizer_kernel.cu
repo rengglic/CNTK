@@ -2,13 +2,17 @@
 #define __MATRIX_QUANTIZER_KERNEL_CUH__
 #include <float.h>
 #include <cuda.h>
+#include <curand_kernel.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <device_launch_parameters.h>
+#include <cub/cub.cuh>
 
+#include "Constants.h"
 #include "ValueQuantizer.h"
 #include "ColumnQuantizer.h"
 #include "QuantizedMatrix.h"
+#include "TopKMatrix.h"
 
 namespace Microsoft { namespace MSR { namespace CNTK {
 
@@ -302,6 +306,242 @@ void _UnquantizeMatrix(const char* gpuBuffer, size_t gpuBufferSize,
     ParallelizeOverRangeDim(totalQWords, griddim, blockdim, 256);
     UnquantizeStripejOneQWord<<<griddim, blockdim, 0, stream>>>(us, M, N, gpuBuffer, colsize, numQWordsPerCol, ldNbits, add);
 }
+
+const unsigned long long int constBitOff = 32;
+const unsigned long long int constBitMaskAll1 = (1LL << constBitOff) - 1;
+
+__device__ void _packValueAndPosition(unsigned long long int integerRepresentation, unsigned int position, unsigned long long int &packed)
+{
+    packed = (integerRepresentation << constBitOff) | position;
+}
+
+__device__ void _unpackValueAndPosition(unsigned int &integerRepresentation, unsigned int &position, unsigned long long int packed)
+{
+    integerRepresentation = (packed >> constBitOff) & constBitMaskAll1;
+    position = packed & constBitMaskAll1;
+}
+
+#define ITEMS_PER_THREAD 4
+#define WARP_SIZE (TOPK_NUMELEMENTS / ITEMS_PER_THREAD)
+template <class ElemType>
+__global__ void _selectK(
+        const ElemType* us,
+        ElemType* curResidual,
+        long numBuckets,
+        char* buffer,
+        size_t topK,
+        ElemType* newResidual,
+        size_t totalNumElements)
+{
+    // map our thread index into a linear index
+    const size_t linindex = ParallelizeOverRangeIndex();
+
+    // map to (QWord index, column index)
+    const size_t currBucket = blockIdx.x;
+
+    // get data pointers to the k elements of the bucket
+    size_t qColSize = sizeof(unsigned long long int);
+    size_t bucketOffset = currBucket * topK * qColSize;
+
+    // and quantizer
+    size_t realNumRows = min((size_t)TOPK_NUMELEMENTS, totalNumElements - currBucket * TOPK_NUMELEMENTS);
+
+    //typedef cub::BlockLoad<int, WARP_SIZE, ITEMS_PER_THREAD> BlockLoadT;
+    typedef cub::BlockScan<int, WARP_SIZE> BlockScanT;
+    typedef cub::BlockReduce<ElemType, WARP_SIZE> BlockReduceT;
+
+    // Shared memory
+    __shared__ union
+    {
+        typename BlockScanT::TempStorage scan;
+        typename BlockReduceT::TempStorage reduce;
+    } temp_storage;
+
+    // Calculate inf and 1 norm
+    ElemType absVals[ITEMS_PER_THREAD];
+
+    int offset = (threadIdx.x * ITEMS_PER_THREAD);
+    int idx = (blockIdx.x * TOPK_NUMELEMENTS) + offset;
+    // TODO use cub::BlockLoad??
+    for(int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if(idx + i < totalNumElements) {
+            absVals[i] = fabs(curResidual[idx + i] + us[idx + i]);
+        } else {
+            absVals[i] = 0.0;
+        }
+    }
+
+    __syncthreads();
+
+    // Calc statistics
+    //__shared__ ElemType infNorm;
+    __shared__ ElemType oneNorm;
+
+    //ElemType redVal = BlockReduceT(temp_storage.reduce).Reduce(absVals, cub::Max());
+    //if(threadIdx.x == 0) {
+    //    infNorm = redVal;
+    //    //printf("Inf-Norm: %f\n", infNorm);
+    //}
+    //__syncthreads();
+
+    ElemType redVal = BlockReduceT(temp_storage.reduce).Sum(absVals);
+    if(threadIdx.x == 0) {
+        oneNorm = redVal;
+        //printf("One-Norm: %f\n", oneNorm);
+    }
+    __syncthreads();
+
+    //// Calc epsilon if needed
+    //if(infNorm > oneNorm / topK) {
+    //    eps = (topK * infNorm - oneNorm) / (TOPK_NUMELEMENTS - topK);
+    //    //if(threadIdx.x == 0)
+    //    //    printf("EPSILON: %f\n", eps);
+    //}
+
+    curandState state;
+    curand_init((unsigned long long)clock() + linindex, 0, 0, &state);
+    float prob = 0.0;
+    prob = topK / (oneNorm + TOPK_NUMELEMENTS);
+    //prob = topK / (oneNorm + TOPK_NUMELEMENTS * eps);
+
+    int take[ITEMS_PER_THREAD];
+    int indices[ITEMS_PER_THREAD];
+
+    for(int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if(idx + i < totalNumElements) {
+            take[i] = (curand_uniform(&state) <= (prob * absVals[i])) ? 1 : 0;
+            //take[i] = (curand_uniform(&state) <= (prob * (absVals[i] + eps))) ? 1 : 0;
+            //printf("Taking: %d - %d\n", idx + i, take[i]);
+        } else {
+            take[i] = 0;
+        }
+    }
+
+    // TODO Hacky! (change to not only select the first k elements!)
+
+    __syncthreads();
+
+    BlockScanT(temp_storage.scan).InclusiveSum(take, indices);
+
+    for(int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if(idx + i < totalNumElements) {
+            size_t ij = idx + i;
+            if(take[i] > 0 && indices[i] <= topK) {
+                ElemType val = curResidual[ij] + us[ij];
+
+                auto& qCol = *(Microsoft::MSR::CNTK::TopKColumn<ElemType>*) &buffer[bucketOffset + ((indices[i]-1) * qColSize)];
+
+                unsigned int integerRepresentation = *(unsigned int*) &val;
+                unsigned pos = offset + i;
+                _packValueAndPosition(integerRepresentation, pos, qCol.valuesAndPositions[0]);
+
+                newResidual[ij] = 0;
+            } else {
+                newResidual[ij] = curResidual[ij] + us[ij];
+            }
+        }
+    }
+
+    __syncthreads();
+    if(threadIdx.x == blockDim.x -1) {
+        // Last threads fills up with the last possible index in order for the sparse sum to work!
+        //unsigned lastIdx = (blockIdx.x * TOPK_NUMELEMENTS) + realNumRows - 1;
+        unsigned lastIdx = realNumRows - 1;
+        for(size_t i = indices[ITEMS_PER_THREAD-1]; i < topK; ++i) {
+            auto& qCol = *(Microsoft::MSR::CNTK::TopKColumn<ElemType>*) &buffer[bucketOffset + (i * qColSize)];
+            ElemType tmp = 0;
+
+            unsigned int integerRepresentation = *(unsigned int*) &tmp;
+            _packValueAndPosition(integerRepresentation, lastIdx, qCol.valuesAndPositions[0]);
+        }
+    }
+}
+
+template <class ElemType>
+__global__ void _reset(ElemType* us, size_t totalNumElements)
+{
+    int offset = (threadIdx.x * ITEMS_PER_THREAD);
+    int idx = (blockIdx.x * TOPK_NUMELEMENTS) + offset;
+    // TODO use cub::BlockLoad??
+    for(int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if(idx + i < totalNumElements) {
+            us[idx + i] = 0.0;
+        }
+    }
+}
+
+template <class ElemType>
+__global__ void _writeBackK(ElemType* us, const char* buffer, const size_t colsize, size_t totalNumElements)
+{
+    // this follows the same as  quantizestripej()
+    // map our thread index into a linear index
+    const size_t linindex = ParallelizeOverRangeIndex();
+    const size_t offset = blockIdx.x * TOPK_NUMELEMENTS;
+
+    if(linindex < totalNumElements) {
+        const auto& qcol = *(const Microsoft::MSR::CNTK::TopKColumn<ElemType>*) &buffer[colsize * linindex];
+
+        unsigned int position, integerRepresentation;
+        _unpackValueAndPosition(integerRepresentation, position, qcol.valuesAndPositions[0]);
+
+        ElemType value = *(ElemType*) &integerRepresentation;
+
+        us[offset + position] += value;
+    }
+}
+
+template <class ElemType>
+void _TopKMatrix(
+        const ElemType* us,
+        ElemType* curResidual,
+        long M, long N,
+        char* buffer,
+        size_t topK,
+        cudaStream_t stream,
+        ElemType* newResidual)
+{
+    size_t numElements = M * N;
+    size_t numBuckets = (numElements + (TOPK_NUMELEMENTS - 1)) / TOPK_NUMELEMENTS;
+
+    //fprintf(stderr, "M: %lu\n", M);
+    //fprintf(stderr, "N: %lu\n", N);
+    //fprintf(stderr, "TOPK_NUMELEMENTS: %i\n", TOPK_NUMELEMENTS);
+    //fprintf(stderr, "NumElements: %lu\n", numElements);
+    //fprintf(stderr, "NumBuckets: %lu\n", numBuckets);
+    //fprintf(stderr, "WARP_SIZE: %i\n", WARP_SIZE);
+
+    dim3 griddim, blockdim;
+    griddim = numBuckets;
+    blockdim = WARP_SIZE;
+    _selectK<ElemType><<<griddim, blockdim, 0, stream>>>(us, curResidual, numBuckets, buffer, topK, newResidual, numElements);
+}
+
+template <class ElemType>
+void _UnTopKMatrix(const char* gpuBuffer, size_t gpuBufferSize,
+        ElemType* us, long M, long N,
+        bool add, cudaStream_t stream,
+        int topK)
+{
+    const size_t colsize = TopKColumn<ElemType>::TopKColumnSize(1);
+    if (gpuBufferSize == 0) // empty buffer: empty matrix, we are done (explicit test needed since launch will fail with 0 threads)
+        return;
+
+    size_t nofItems = gpuBufferSize / colsize;
+    size_t numElements = M * N;
+    size_t numBuckets = (numElements + (TOPK_NUMELEMENTS - 1)) / TOPK_NUMELEMENTS;
+
+    dim3 griddim, blockdim;
+    if(!add) {
+        griddim = numBuckets;
+        blockdim = WARP_SIZE;
+        _reset<ElemType><<<griddim, blockdim, 0, stream>>>(us, numElements);
+    }
+
+    griddim = numBuckets;
+    blockdim = topK;
+    _writeBackK<<<griddim, blockdim, 0, stream>>>(us, gpuBuffer, colsize, nofItems);
+}
+
 }
 }
 }

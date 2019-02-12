@@ -105,6 +105,30 @@ void MatrixQuantizerCPU<ElemType>::WaitUnquantizeAsyncDone()
     // TODO: Currently this is a no-op since the actual quantization is synchronous
 }
 
+    template <class ElemType>
+void MatrixQuantizerCPU<ElemType>::TopKAsync(const Matrix<ElemType>& inMatrix, const Matrix<ElemType>& inResidual, TopKMatrix<ElemType>& outQMatrix, Matrix<ElemType>& outResidual, int topK)
+{
+    assert(false);
+}
+
+    template <class ElemType>
+void MatrixQuantizerCPU<ElemType>::WaitTopKAsyncDone()
+{
+    assert(false);
+}
+
+    template <class ElemType>
+void MatrixQuantizerCPU<ElemType>::UnTopKAsync(TopKMatrix<ElemType>& inQMatrix, Matrix<ElemType>& outMatrix, int topK, bool add)
+{
+    assert(false);
+}
+
+    template <class ElemType>
+void MatrixQuantizerCPU<ElemType>::WaitUnTopKAsyncDone()
+{
+    assert(false);
+}
+
 //The explicit instantiation part will make the linker happy
 template class MatrixQuantizerCPU<float>;
 template class MatrixQuantizerCPU<double>;
