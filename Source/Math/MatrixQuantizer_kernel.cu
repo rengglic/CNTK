@@ -503,13 +503,6 @@ void _TopKMatrix(
     size_t numElements = M * N;
     size_t numBuckets = (numElements + (TOPK_NUMELEMENTS - 1)) / TOPK_NUMELEMENTS;
 
-    //fprintf(stderr, "M: %lu\n", M);
-    //fprintf(stderr, "N: %lu\n", N);
-    //fprintf(stderr, "TOPK_NUMELEMENTS: %i\n", TOPK_NUMELEMENTS);
-    //fprintf(stderr, "NumElements: %lu\n", numElements);
-    //fprintf(stderr, "NumBuckets: %lu\n", numBuckets);
-    //fprintf(stderr, "WARP_SIZE: %i\n", WARP_SIZE);
-
     dim3 griddim, blockdim;
     griddim = numBuckets;
     blockdim = WARP_SIZE;

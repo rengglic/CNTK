@@ -89,8 +89,6 @@ public:
             if (deviceId != CPUDEVICE)
                 m_allocator.reset(new CUDAPageLockedMemAllocator(deviceId));
 
-            fprintf(stderr, "HIER! Init with %d bits and top-%d (out of 512)\n", m_numQuantizationBits, m_topK);
-
             for (size_t i = 0; i < gradients.size(); i++)
             {
                 // Make sure none of the gradient matrices are sparse - we currently do not support aggregation of sparse gradient matrices
