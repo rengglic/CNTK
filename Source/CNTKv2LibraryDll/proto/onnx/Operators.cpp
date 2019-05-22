@@ -483,13 +483,13 @@ namespace ONNX
             { L"offset", "border"},
         } } },
         { L"OneHotOp", { {
-            { L"OneHotOp", "OneHotEncoder"},
+            { L"OneHotOp", "OneHot"},
         } } },
         { L"EyeLikeOp",{ {
             { L"EyeLikeOp", "EyeLike" },
         } } },
         { L"ConstantOp",{ {
-            { L"ConstantOp", "ConstantLike" },
+            { L"ConstantOp", "ConstantOfShape" },
         } } },
     };
 
@@ -643,5 +643,19 @@ namespace ONNX
             { "Crop" },
         };
 
+        std::string GetRootPath(const std::string& rootPath)
+        {
+            std::string rootPath_ = rootPath;
+            // first make slash consistent (sorry for Linux users:this is not necessary for you)
+            std::replace(rootPath_.begin(), rootPath_.end(), '\\', '/');
+
+            // second, remove trailing slash if there is any
+            std::regex trailer("/+$");
+            std::string root = std::regex_replace(rootPath_, trailer, std::string());
+
+            std::string folder = root.substr(0, root.find_last_of('/'));
+
+            return folder;
+        }
     }
 }

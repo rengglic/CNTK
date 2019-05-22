@@ -99,6 +99,7 @@ ONNX_REPO_PATH:=$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo
 ONNX_REPO_PATH+=$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx
 ONNX_REPO_PATH+=$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime
 ONNX_REPO_PATH+=$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/include/onnxruntime
+ONNX_REPO_PATH+=$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/patch/onnxruntime/platform_specifics/linux
 INCLUDEPATH:= $(addprefix $(SOURCEDIR)/, Common/Include CNTKv2LibraryDll CNTKv2LibraryDll/API CNTKv2LibraryDll/API/Internals CNTKv2LibraryDll/Generated/Linux CNTKv2LibraryDll/proto ../Examples/Extensibility/CPP Math CNTK ActionsLib ComputationNetworkLib SGDLib SequenceTrainingLib CNTK/BrainScript Readers/ReaderLib PerformanceProfilerDll)
 INCLUDEPATH+=$(PROTOBUF_PATH)/include
 INCLUDEPATH+=$(GSL_PATH)/include
@@ -274,9 +275,13 @@ ifdef CNTK_CUDA_DEVICE_DEBUGINFO
   CUFLAGS += -G
 endif
 
+# Make sure we statically link with protobuf and avoid leaking symbols
+# (as users of this library may use their own version of protobuf library)
+PROTOBUF_STATIC_LIB:= $(PROTOBUF_PATH)/lib/libprotobuf.a -Wl,--exclude-libs,libprotobuf.a
+
 # Create the library link options for the linker.
 # LIBS_LIST must not be changed beyond this point.
-LIBS:= $(addprefix -l,$(LIBS_LIST))
+LIBS:= $(addprefix -l,$(LIBS_LIST)) $(PROTOBUF_STATIC_LIB)
 
 OBJDIR:= $(BUILD_TOP)/.build
 BINDIR:= $(BUILD_TOP)/bin
@@ -532,10 +537,22 @@ CNTKLIBRARY_COMMON_SRC =\
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/common/logging/logging.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/common/profiler.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/common/status.cc \
-	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/tensorutils.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/common/str_helper.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/allocator.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/data_types.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/environment.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/error_code.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/onnxruntime_typeinfo.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/tensor.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/tensorprotoutils.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/tensor_external_data_info.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/tensor_shape.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/framework/tensor_type_and_shape.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/graph/contrib_ops/attn_lstm_schema_defs.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/graph/contrib_ops/contrib_defs.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/graph/contrib_ops/range_schema_defs.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/graph/function.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/graph/graph.cc \
-	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/graph/graph_transformer_mgr.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/graph/graph_viewer.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/graph/model.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/graph/op.cc \
@@ -545,6 +562,10 @@ CNTKLIBRARY_COMMON_SRC =\
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/platform/posix/env.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/platform/posix/env_time.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/platform/posix/stacktrace.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/platform/posix/ort_mutex.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/patch/onnxruntime/core/common/logging/ostream_sink.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/patch/onnxruntime/core/session/onnxruntime_c_api.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/patch/onnxruntime/core/framework/path_lib.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/checker.cpp \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/common/assertions.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/common/model_helpers.cc \
@@ -572,8 +593,8 @@ CNTKLIBRARY_COMMON_SRC =\
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/defs/data_type_utils.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/defs/schema.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/shape_inference/implementation.cc \
-	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/onnx-ml.pb.cc \
-	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/onnx-operators-ml.pb.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/protobuf/onnx-ml.pb.cc \
+	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnxruntime/core/protobuf/onnx-operators-ml.pb.cc \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/Operators.cpp \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/RNNHelper.cpp \
 	$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/CNTKToONNX.cpp \
@@ -687,6 +708,7 @@ SGDLIB_SRC=\
 	$(SOURCEDIR)/SGDLib/Profiler.cpp \
 	$(SOURCEDIR)/SGDLib/SGD.cpp \
 	$(SOURCEDIR)/SGDLib/PostComputingActions.cpp \
+	$(SOURCEDIR)/SGDLib/SimpleDistGradAggregatorHelper.cpp \
 
 SGDLIB_SRC+=$(CNTKLIBRARY_COMMON_SRC)
 
@@ -1708,13 +1730,13 @@ ONNXRUNTIME_PROTO_PATH=$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnxruntime/onnx
 	@echo $(SEPARATOR)
 	@echo compiling protobuf from $(ONNXRUNTIME_PROTO_PATH)
 	# protoc is confused if --proto_path is not set to an absolute path in below usage
-	$(PROTOC) --proto_path=$(ONNXRUNTIME_PROTO_PATH)/ --cpp_out=$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/ $(ONNXRUNTIME_PROTO_PATH)/onnx-ml.proto
+	$(PROTOC) --proto_path=$(ONNXRUNTIME_PROTO_PATH)/ --cpp_out=$(ONNXRUNTIME_PROTO_PATH)/ $(ONNXRUNTIME_PROTO_PATH)/onnx-ml.proto
 
 %onnx-operators-ml.pb.cc : %onnx-operators-ml.proto $(BUILD_CONFIGURATION)
 	@echo $(SEPARATOR)
 	@echo compiling protobuf from $(ONNXRUNTIME_PROTO_PATH)
 	# protoc is confused if --proto_path is not set to an absolute path in below usage
-	$(PROTOC) --proto_path=$(ONNXRUNTIME_PROTO_PATH)/ --cpp_out=$(SOURCEDIR)/CNTKv2LibraryDll/proto/onnx/onnx_repo/onnx/ $(ONNXRUNTIME_PROTO_PATH)/onnx-operators-ml.proto
+	$(PROTOC) --proto_path=$(ONNXRUNTIME_PROTO_PATH)/ --cpp_out=$(ONNXRUNTIME_PROTO_PATH)/ $(ONNXRUNTIME_PROTO_PATH)/onnx-operators-ml.proto
 
 %.pb.cc : %.proto $(BUILD_CONFIGURATION)
 	@echo $(SEPARATOR)

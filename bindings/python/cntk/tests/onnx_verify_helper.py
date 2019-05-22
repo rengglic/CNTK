@@ -11,35 +11,19 @@ onnx = pytest.importorskip("onnx")
 windows = os.getenv("OS")=="Windows_NT"
 
 known_issues = [
-    'BatchNormalization_float160',
     'SpatialBatchNormalization_float160',
     'RNN.reverse.one_layer.relu',
-    'RNN.bidirectional.two_layer.tanh',
-    'test_sequence_slice_-1.0',
-    'test_sequence_slice_0.-1',
-    'test_sequence_slice_0.1',
-    'test_sequence_slice_1.-1',
-    'test_sequence_slice_1.0',
-    'test_sequence_slice_1.2',
-    'test_sequence_slice_-2.-1',
-    'test_sequence_slice_-4.2',
-    'SequenceSoftmax',
-    'top_k',
 
-    # Not in onnxruntime
-    'LayerNorm_0',
-    'MVN_0',
-    'MVN_1',
-    'MVN_2',
-    'MVN_3',
-    'Eye_Like_0',
+    # onnxruntime supports only [NCHW] for mvn.
+    'LayerNorm_0(10_)',
+    'LayerNorm_0(20_ 31)',
 ]
 
 def parse_single_result_case(case_str):
-    fails = re.search(r'Failed Test Cases:[\w\.\-]+', case_str)
+    fails = re.search(r'Failed Test Cases:[\w\.\-\_\(\)\s]+', case_str)
     if fails:
         failed_case = fails.group().split(':')[1]
-        if not failed_case in known_issues:
+        if not failed_case in known_issues and not failed_case:
             print(case_str, file=sys.stderr)
             return 1
     return 0
@@ -57,12 +41,29 @@ def parse_verify_out_str(content):
 
     return total_failed_cases
 
+def get_onnx_test_runner_path_str():
+    # find onnx_test_runner.exe from repo source in default. 
+    # in case not found (in the build environment), look for based on environment variables. 
+    onnx_test_runner_path_str = os.path.join(os.path.dirname(__file__), 'onnx_test_runner') + R'/onnx_test_runner.exe';
+    if not os.path.exists(onnx_test_runner_path_str):
+        workspace_path = None
+        if 'BUILD_REPOSITORY_LOCALPATH' in os.environ:
+            workspace_path = os.environ['BUILD_REPOSITORY_LOCALPATH']
+        elif 'WORKSPACE' in os.environ:
+            workspace_path = os.environ['WORKSPACE']
+        elif 'WINDOWS_WORKSPACE' in os.environ:
+            workspace_path = os.environ['WINDOWS_WORKSPACE']
+
+        assert (workspace_path, 'None of BUILD_REPOSITORY_LOCALPATH, WORKSPACE, or WINDOWS_WORKSPACE is set in os.environ')
+        onnx_test_runner_path_str = workspace_path + R'/bindings/python/cntk/tests/onnx_test_runner/onnx_test_runner.exe';
+
+    assert(os.path.exists(onnx_test_runner_path_str), onnx_test_runner_path_str + ' does not exist.')
+    return onnx_test_runner_path_str
+
 def verify_results_with_onnxruntime(model_name, model_dir):
-    path_prefix = os.path.join(os.environ['CNTK_EXTERNAL_TESTDATA_SOURCE_DIRECTORY'], 'ONNXRuntime') if 'CNTK_EXTERNAL_TESTDATA_SOURCE_DIRECTORY' in os.environ else ''
-    onnx_test_runner_path_str = str(os.path.join(path_prefix, 'onnx_test_runner.exe'))
-    # run only on windows. 
-    if not os.path.exists(onnx_test_runner_path_str) or not windows:
+    if not windows:
         return 0
+    onnx_test_runner_path_str = get_onnx_test_runner_path_str()
     callargs = [onnx_test_runner_path_str, '-n', model_name, str(model_dir)]
     process = subprocess.run(callargs, stdout=subprocess.PIPE)
     return parse_verify_out_str(process.stdout.decode('utf-8'))

@@ -9,6 +9,7 @@
 #include "CNTKLibrary.h"
 
 #include <set>
+#include <regex>
 
 namespace onnxruntime
 {
@@ -88,7 +89,10 @@ public:
 
     static inline bool IsBlockFnNotConvertedThroughBlockRoot(FunctionPtr blkF)
     {
-        return blkF->OpName() == L"Sequence::BroadcastAs";
+        return 
+            blkF->OpName() == L"Sequence::BroadcastAs" || 
+            blkF->OpName() == L"ElementMax" || 
+            blkF->OpName() == L"Convolution";
     }
 
     //
@@ -212,5 +216,6 @@ private:
     static std::set<std::string> _onnxSimpleBatchAxisOps;
 };
 
+std::string GetRootPath(const std::string& rootPath);
 } // namespace ONNX
 } // namespace CNTK
