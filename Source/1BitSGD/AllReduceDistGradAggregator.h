@@ -77,6 +77,18 @@ public:
         return topK;
     }
 
+    std::shared_ptr<ElemType> AllocateIntermediateBuffer(int deviceID, size_t numElements)
+    {
+        assert(deviceID >= 0);
+
+        // Use pinned memory for GPU devices for better copy performance
+        size_t totalSize = sizeof(ElemType) * numElements;
+        return std::shared_ptr<ElemType>((ElemType*) m_allocator->Malloc(totalSize), [this, deviceID](ElemType* p)
+                                         {
+                                             m_allocator->Free(p);
+                                         });
+    }
+
     void ResetState(const std::vector<Matrix<ElemType>*>& gradients, int numEvalNodes, bool resetState)
     {
         // When called the first time let's setup the quantizers and matrices for holding quantized values.
@@ -88,8 +100,6 @@ public:
             int deviceId = gradients[0]->GetDeviceId();
             if (deviceId != CPUDEVICE)
                 m_allocator.reset(new CUDAPageLockedMemAllocator(deviceId));
-
-            fprintf(stderr, "HIER! Init with %d bits and top-%d (out of 512)\n", m_numQuantizationBits, m_topK);
 
             for (size_t i = 0; i < gradients.size(); i++)
             {
@@ -103,8 +113,10 @@ public:
                 size_t topK = GetTopK(numElementsPerBuckets, m_topK);
 
                 m_preAggGradQuantizers.push_back(std::unique_ptr<MatrixQuantizer<ElemType>>(new MatrixQuantizer<ElemType>(nRow, nCol, deviceId, m_useAsyncAggregation)));
-                m_gradQuantized.push_back(std::unique_ptr<QuantizedMatrix<ElemType>>(new QuantizedMatrix<ElemType>(nRow, nCol, m_numQuantizationBits, CPUDEVICE, m_allocator.get())));
+                m_gpuDataTransferers.push_back(std::make_unique<GPUDataTransferer>(deviceId, m_useAsyncAggregation));
                 m_gradTopK.push_back(std::unique_ptr<TopKMatrix<ElemType>>(new TopKMatrix<ElemType>(nRow, nCol, m_topK, CPUDEVICE, m_allocator.get())));
+                m_intermediateCPUBuffers.push_back(AllocateIntermediateBuffer(deviceId, gradients[i]->GetNumElements()));
+                m_aggGrad.push_back(std::unique_ptr<Matrix<ElemType>>(new Matrix<ElemType>(nRow, nCol, m_intermediateCPUBuffers[i].get(), CPUDEVICE, matrixFlagDontOwnBuffer)));
 
                 // Determine which stripe of the gradient is this node responsible for
                 Stripe stripe = GetStripeForNode(nCol, MyRank(), NumProc());
@@ -118,7 +130,6 @@ public:
                         currRecvGradStripesTopK.push_back(std::unique_ptr<TopKMatrix<ElemType>>(new TopKMatrix<ElemType>(nRow, nCol, m_topK, CPUDEVICE, m_allocator.get())));
                 }
 
-                m_aggGradStripeQuantizers.push_back(std::unique_ptr<MatrixQuantizer<ElemType>>(currAggGradQuantizer));
                 m_recvGradStripesTopK.push_back(std::move(currRecvGradStripesTopK));
 
                 if (m_useAsyncAggregation)
@@ -147,12 +158,6 @@ public:
 
             for (size_t i = 0; i < m_preAggGradQuantizers.size(); ++i)
                 m_preAggGradQuantizers[i]->ResetResidue();
-
-            for (size_t i = 0; i < m_aggGradStripeQuantizers.size(); ++i)
-            {
-                if (m_aggGradStripeQuantizers[i] != nullptr)
-                    m_aggGradStripeQuantizers[i]->ResetResidue();
-            }
 
             // Zero out the buffered gradients if resetting state
             if (m_useAsyncAggregation)
@@ -285,8 +290,6 @@ public:
         }
 
         std::vector<std::unique_ptr<Matrix<ElemType>>> aggGradStripes;
-        std::vector<std::unique_ptr<QuantizedMatrix<ElemType>>> aggGradStripesQuantized;
-        std::vector<std::unique_ptr<TopKMatrix<ElemType>>> aggGradStripesTopK;
         for (size_t i = 0; i < gradients.size(); i++)
         {
             size_t nCol = gradients[i]->GetNumCols();
@@ -295,18 +298,12 @@ public:
             Stripe stripe = GetStripeForNode(nCol, MyRank(), NumProc());
 
             Matrix<ElemType>* currAggGradStripe = nullptr;
-            QuantizedMatrix<ElemType>* currAggGradStripeQuantized = nullptr;
-            TopKMatrix<ElemType>* currAggGradStripeTopK = nullptr;
             if (stripe.m_numCols > 0)
             {
                 currAggGradStripe = new Matrix<ElemType>(gradients[i]->ColumnSlice(stripe.m_startCol, stripe.m_numCols));
-                currAggGradStripeQuantized = new QuantizedMatrix<ElemType>(m_gradQuantized[i]->ColumnSlice(stripe.m_startCol, stripe.m_numCols));
-                currAggGradStripeTopK = new TopKMatrix<ElemType>(m_gradTopK[i]->ColumnSlice(stripe.m_startCol, stripe.m_numCols));
             }
 
             aggGradStripes.push_back(std::unique_ptr<Matrix<ElemType>>(currAggGradStripe));
-            aggGradStripesQuantized.push_back(std::unique_ptr<QuantizedMatrix<ElemType>>(currAggGradStripeQuantized));
-            aggGradStripesTopK.push_back(std::unique_ptr<TopKMatrix<ElemType>>(currAggGradStripeTopK));
         }
 
         // Initiate TopK of the gradient matrices
@@ -444,18 +441,6 @@ public:
             m_preAggGradQuantizers[gradMatrixIdx]->UnTopKAsync(*(m_recvGradStripesTopK[gradMatrixIdx][recvBufferSubIndex]), *(aggGradStripes[gradMatrixIdx]), m_topK, true);
 
             perGradMatrixReceiveCount[gradMatrixIdxPosition]++;
-
-            // Also issue the quantization if this stripe was the last one expected for this matrix
-            // Note: We issue the quantization without waiting for the unquantization since the same stream
-            // is used for both and they are implicitly sequenced
-            // We reuse the buffer that we used for quantizing and sending out the pre-aggregation gradient
-            if (perGradMatrixReceiveCount[gradMatrixIdxPosition] == (NumProc() - 1))
-            {
-                Stripe stripe = GetStripeForNode(gradients[gradMatrixIdx]->GetNumCols(), MyRank(), NumProc());
-                UNUSED(stripe);
-                assert(stripe.m_numCols > 0);
-                m_aggGradStripeQuantizers[gradMatrixIdx]->QuantizeAsync(*(aggGradStripes[gradMatrixIdx]), *(aggGradStripesQuantized[gradMatrixIdx]), m_zeroThresholdFor1Bit);
-            }
         }
 
         assert(numActualReceives == numReceivesExpected);
@@ -479,50 +464,32 @@ public:
             assert(numNodesHeadersReceivedFrom == (NumProc() - 1));
         }
 
-        std::vector<std::vector<MPI_Request>> recvAggGradStripesQuantizedRequests(numGradMatrices);
+        std::vector<MPI_Request> iAllGatherRequests(numGradMatrices);
+        size_t requestIdx = 0;
         // Initiate receive of stripes of quantized aggregated gradients from different nodes
         for (size_t i = 0; i < numGradMatrices; ++i)
         {
-            size_t recvRequestIdx = 0;
+            int cnt[NumProc()];
+            int disp[NumProc()];
+            disp[0] = 0;
             for (size_t j = 0; j < NumProc(); ++j)
             {
-                // Do not recv stripe for self
-                if (j != MyRank())
-                {
                     Stripe stripe = GetStripeForNode(gradients[i]->GetNumCols(), j, NumProc());
-                    if (stripe.m_numCols > 0)
-                    {
-                        recvAggGradStripesQuantizedRequests[i].push_back(MPI_Request());
-                        QuantizedMatrix<ElemType> quantizedStripe = m_gradQuantized[i]->ColumnSlice(stripe.m_startCol, stripe.m_numCols);
-                        m_mpi->Irecv(quantizedStripe.Buffer(), quantizedStripe.GetSize(), MPI_CHAR, j, numGradMatrices + 1 + i, &(recvAggGradStripesQuantizedRequests[i][recvRequestIdx])) || MpiFail("MPI_Irecv");
-                        recvRequestIdx++;
+                    Matrix<ElemType> slice = m_aggGrad[i]->ColumnSlice(stripe.m_startCol, stripe.m_numCols);
+                    cnt[j] = slice.GetNumElements()*sizeof(ElemType);
+                    if(j > 0) {
+                        disp[j] = disp[j-1] + cnt[j-1];
                     }
-                }
+
             }
+            m_mpi->Iallgatherv(aggGradStripes[i]->Data(), aggGradStripes[i]->GetNumElements()*sizeof(ElemType), m_aggGrad[i]->Data(), &cnt[0], &disp[0], &iAllGatherRequests[i]) || MpiFail("MPI_Iallgatherv");
+            requestIdx++;
         }
 
         MPI_Request recvAggHeaderRequest;
         // Initiate receive of the aggregate header
         if (!m_mpi->IsMainNode())
             m_mpi->Irecv(headerCPU, headerCPU->Size(), MPI_CHAR, m_mpi->MainNodeRank(), numGradMatrices + 1 + numGradMatrices, &recvAggHeaderRequest) || MpiFail("MPI_Irecv");
-
-        // Initiate broadcast of quantized aggregated gradient stripes to all other nodes
-        std::vector<std::vector<MPI_Request>> sendAggGradStripeQuantizedRequests(numGradMatrices);
-        for (size_t i = 0; i < numGradMatrices; ++i)
-        {
-            Stripe stripe = GetStripeForNode(gradients[i]->GetNumCols(), MyRank(), NumProc());
-            if (stripe.m_numCols > 0)
-            {
-                sendAggGradStripeQuantizedRequests[i] = std::vector<MPI_Request>(NumProc() - 1);
-                m_aggGradStripeQuantizers[i]->WaitQuantizeAsyncDone();
-                for (size_t j = 0; j < NumProc() - 1; ++j)
-                {
-                    int dest = (j >= MyRank()) ? (j + 1) : j;
-                    // TODO: Should we use MPI_Bcast instead for better performance
-                    m_mpi->Isend(aggGradStripesQuantized[i]->Buffer(), aggGradStripesQuantized[i]->GetSize(), MPI_CHAR, dest, numGradMatrices + 1 + i, &(sendAggGradStripeQuantizedRequests[i][j])) || MpiFail("MPI_Irecv");
-                }
-            }
-        }
 
         // Initiate send of the aggregate header from main node
         std::vector<MPI_Request> sendAggHeaderRequests(NumProc() - 1);
@@ -539,19 +506,18 @@ public:
         // Wait to receive all aggregated stripes and unquantize
         for (size_t i = 0; i < numGradMatrices; ++i)
         {
-            m_mpi->Waitall(recvAggGradStripesQuantizedRequests[i].size(), recvAggGradStripesQuantizedRequests[i].data(), MPI_STATUSES_IGNORE) || MpiFail("MPI_Waitall");
-
-            m_preAggGradQuantizers[i]->UnquantizeAsync(*(m_gradQuantized[i]), *(gradients[i]), false);
+            MPI_Wait(&iAllGatherRequests[i], MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
+            m_gpuDataTransferers[i]->CopyCPUToGPUAsync(m_aggGrad[i].get(), gradients[i]->GetNumElements(), gradients[i]->Data());
         }
 
         // Wait to receive aggregate header
         if (!m_mpi->IsMainNode())
             m_mpi->Wait(&recvAggHeaderRequest, MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
 
-        // Wait for all the unquantizations to finish
+        // Wait for all the async copy to finish
         for (size_t i = 0; i < numGradMatrices; ++i)
         {
-            m_preAggGradQuantizers[i]->WaitUnquantizeAsyncDone();
+            m_gpuDataTransferers[i]->WaitForCopyCPUToGPUAsync();
 
             if (m_traceLevel >= DEBUG_OUTPUT_TRACE_LEVEL)
             {
@@ -561,21 +527,8 @@ public:
             }
         }
 
-        // Wait for completion of the async send requests
-        for (int i = 0; i < sendGradStripesTopKRequests.size(); ++i)
-        {
-            if (sendGradStripesTopKRequests[i].size() > 0)
-                m_mpi->Waitall(sendGradStripesTopKRequests[i].size(), sendGradStripesTopKRequests[i].data(), MPI_STATUSES_IGNORE) || MpiFail("MPI_Waitall");
-        }
-
         if (!m_mpi->IsMainNode())
             m_mpi->Wait(&sendHeaderRequest, MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
-
-        for (int i = 0; i < sendAggGradStripeQuantizedRequests.size(); ++i)
-        {
-            if (sendAggGradStripeQuantizedRequests[i].size() > 0)
-                m_mpi->Waitall(sendAggGradStripeQuantizedRequests[i].size(), sendAggGradStripeQuantizedRequests[i].data(), MPI_STATUSES_IGNORE) || MpiFail("MPI_Waitall");
-        }
 
         if (m_mpi->IsMainNode())
             m_mpi->Waitall(sendAggHeaderRequests.size(), sendAggHeaderRequests.data(), MPI_STATUSES_IGNORE) || MpiFail("MPI_Waitall");
@@ -613,10 +566,13 @@ private:
     std::unique_ptr<CUDAPageLockedMemAllocator> m_allocator;
 
     std::vector<std::unique_ptr<MatrixQuantizer<ElemType>>> m_preAggGradQuantizers;
-    std::vector<std::unique_ptr<QuantizedMatrix<ElemType>>> m_gradQuantized;
     std::vector<std::unique_ptr<TopKMatrix<ElemType>>> m_gradTopK;
 
-    std::vector<std::unique_ptr<MatrixQuantizer<ElemType>>> m_aggGradStripeQuantizers;
+    std::vector<std::shared_ptr<ElemType>> m_intermediateCPUBuffers;
+    std::vector<std::unique_ptr<Matrix<ElemType>>> m_aggGrad;
+
+    std::vector<std::unique_ptr<GPUDataTransferer>> m_gpuDataTransferers;
+
     std::vector<std::vector<std::unique_ptr<TopKMatrix<ElemType>>>> m_recvGradStripesTopK;
     std::vector<DistGradHeader*> m_recvHeaders;
 

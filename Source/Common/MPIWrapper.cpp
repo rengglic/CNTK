@@ -87,6 +87,7 @@ public:
     virtual int Recv(void* buf, int count, MPI_Datatype datatype, int source, int tag, /*MPI_Comm comm,*/ MPI_Status* status);
     virtual int Irecv(void* buf, int count, MPI_Datatype datatype, int source, int tag, /*MPI_Comm comm,*/ MPI_Request* request);
     virtual int Iallreduce(const void* sendbuf, void* recvbuf, int count, MPI_Datatype datatype, MPI_Op op, /*MPI_Comm comm,*/ MPI_Request* request);
+    virtual int Iallgatherv(const void *sendData, int numSendElements, void* receiveData, int recvCounts[], int offsets[], MPI_Request* request);
     virtual int Abort(int errorcode);
     virtual int Error_string(int errorcode, char* string, int* resultlen);
 
@@ -184,6 +185,7 @@ public:
     virtual int Recv(void* buf, int count, MPI_Datatype datatype, int source, int tag, /*MPI_Comm comm,*/ MPI_Status* status);
     virtual int Irecv(void* buf, int count, MPI_Datatype datatype, int source, int tag, /*MPI_Comm comm,*/ MPI_Request* request);
     virtual int Iallreduce(const void* sendbuf, void* recvbuf, int count, MPI_Datatype datatype, MPI_Op op, /*MPI_Comm comm,*/ MPI_Request* request);
+    virtual int Iallgatherv(const void *sendData, int numSendElements, void* receiveData, int recvCounts[], int offsets[], MPI_Request* request);
     virtual int Abort(int errorcode);
     virtual int Error_string(int errorcode, char* string, int* resultlen);
 
@@ -646,6 +648,11 @@ int MPIWrapperMpi::Iallreduce(const void* sendbuf, void* recvbuf, int count, MPI
     return MPI_Iallreduce(sendbuf, recvbuf, count, datatype, op, m_currentComm, request);
 }
 
+int MPIWrapperMpi::Iallgatherv(const void *sendData, int numSendElements, void* receiveData, int recvCounts[], int offsets[], MPI_Request* request)
+{
+    return MPI_Iallgatherv(sendData, numSendElements, MPI_CHAR, receiveData, recvCounts, offsets, MPI_CHAR, m_currentComm, request);
+}
+
 int MPIWrapperMpi::Abort(int errorcode)
 {
     // we abort through this, so that the MPI system gets the memo
@@ -1025,6 +1032,11 @@ int MPIWrapperEmpty::Irecv(void* buf, int count, MPI_Datatype datatype, int sour
 }
 
 int MPIWrapperEmpty::Iallreduce(const void* sendbuf, void* recvbuf, int count, MPI_Datatype datatype, MPI_Op op, MPI_Request* request)
+{
+    return MPI_UNDEFINED;
+}
+
+int MPIWrapperEmpty::Iallgatherv(const void *sendData, int numSendElements, void* receiveData, int recvCounts[], int offsets[], MPI_Request* request)
 {
     return MPI_UNDEFINED;
 }
